@@ -1,5 +1,6 @@
 import { useState } from "react"
 import type { FormEvent } from "react"
+import Flashcards from "./Flashcards"
 import "./App.css"
 
 const API_URL = "http://127.0.0.1:8000"
@@ -8,12 +9,20 @@ type Source = {
   source_id: number
   page: number
   text: string
-  similarity: number
+  similarity?: number
 }
 
 type AnswerResponse = {
   filename: string
   answer: string
+  sources: Source[]
+}
+
+type SummaryResponse = {
+  filename: string
+  start_page: number
+  end_page: number
+  summary: string
   sources: Source[]
 }
 
@@ -28,12 +37,11 @@ async function readResponse<T>(response: Response): Promise<T> {
   const data = await response.json()
 
   if (!response.ok) {
-    const message =
+    throw new Error(
       typeof data.detail === "string"
         ? data.detail
-        : "The request failed. Check the backend terminal."
-
-    throw new Error(message)
+        : "The request failed. Check the backend terminal.",
+    )
   }
 
   return data as T
@@ -42,9 +50,15 @@ async function readResponse<T>(response: Response): Promise<T> {
 function App() {
   const [file, setFile] = useState<File | null>(null)
   const [document, setDocument] = useState<UploadResponse | null>(null)
+  const [documentVersion, setDocumentVersion] = useState(0)
   const [question, setQuestion] = useState("")
+  const [startPage, setStartPage] = useState("10")
+  const [endPage, setEndPage] = useState("12")
   const [result, setResult] = useState<AnswerResponse | null>(null)
-  const [busy, setBusy] = useState<"upload" | "ask" | null>(null)
+  const [resultTitle, setResultTitle] = useState("Answer")
+  const [busy, setBusy] = useState<
+    "upload" | "ask" | "summary" | "flashcards" | null
+  >(null)
   const [error, setError] = useState("")
 
   async function handleUpload(event: FormEvent<HTMLFormElement>) {
@@ -66,10 +80,16 @@ function App() {
       })
 
       const uploaded = await readResponse<UploadResponse>(response)
+
       setDocument(uploaded)
+      setDocumentVersion((previous) => previous + 1)
+      setStartPage("1")
+      setEndPage(String(Math.min(3, uploaded.page_count)))
     } catch (error) {
       setError(
-        error instanceof Error ? error.message : "Could not upload the PDF.",
+        error instanceof Error
+          ? error.message
+          : "Could not upload the PDF.",
       )
     } finally {
       setBusy(null)
@@ -97,10 +117,73 @@ function App() {
       })
 
       const answer = await readResponse<AnswerResponse>(response)
+
+      setResultTitle("Answer")
       setResult(answer)
     } catch (error) {
       setError(
-        error instanceof Error ? error.message : "Could not get an answer.",
+        error instanceof Error
+          ? error.message
+          : "Could not get an answer.",
+      )
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function handleSummary(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    if (busy) return
+
+    setError("")
+
+    const start = Number(startPage)
+    const end = Number(endPage)
+
+    if (
+      !Number.isInteger(start) ||
+      !Number.isInteger(end) ||
+      start < 1 ||
+      end < start
+    ) {
+      setError("Enter a valid page range.")
+      return
+    }
+
+    if (end - start + 1 > 5) {
+      setError("Select up to 5 pages at a time.")
+      return
+    }
+
+    setResult(null)
+    setBusy("summary")
+
+    try {
+      const response = await fetch(`${API_URL}/summary`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          start_page: start,
+          end_page: end,
+        }),
+      })
+
+      const summary = await readResponse<SummaryResponse>(response)
+
+      setResultTitle(`Summary · Pages ${start}–${end}`)
+      setResult({
+        filename: summary.filename,
+        answer: summary.summary,
+        sources: summary.sources,
+      })
+    } catch (error) {
+      setError(
+        error instanceof Error
+          ? error.message
+          : "Could not generate a summary.",
       )
     } finally {
       setBusy(null)
@@ -112,7 +195,9 @@ function App() {
       <header className="page-header">
         <span className="eyebrow">YOUR LECTURES, EXPLAINED</span>
         <h1>AI Study Assistant</h1>
-        <p>Upload a lecture PDF and ask questions with page references.</p>
+        <p>
+          Ask questions, summarize your lectures, and practice with flashcards.
+        </p>
       </header>
 
       <section className="card" aria-labelledby="upload-heading">
@@ -151,7 +236,7 @@ function App() {
       <section className="card" aria-labelledby="question-heading">
         <h2 id="question-heading">2. Ask a question</h2>
         <p className="muted">
-          You can also ask about the PDF already saved in your backend.
+          Ask about your uploaded lecture or the PDF already saved.
         </p>
 
         <form onSubmit={handleAsk}>
@@ -175,11 +260,64 @@ function App() {
         </form>
       </section>
 
-      {busy && (
+      <section className="card" aria-labelledby="summary-heading">
+        <h2 id="summary-heading">3. Summarize a page range</h2>
+        <p className="muted">
+          Select up to 5 PDF pages. For dense text, you may need a smaller range.
+        </p>
+
+        <form onSubmit={handleSummary}>
+          <div className="page-range">
+            <div>
+              <label htmlFor="start-page">From page</label>
+              <input
+                id="start-page"
+                type="number"
+                min={1}
+                max={document?.page_count}
+                step={1}
+                value={startPage}
+                disabled={busy !== null}
+                onChange={(event) => setStartPage(event.target.value)}
+                required
+              />
+            </div>
+
+            <div>
+              <label htmlFor="end-page">To page</label>
+              <input
+                id="end-page"
+                type="number"
+                min={Number(startPage) || 1}
+                max={document?.page_count}
+                step={1}
+                value={endPage}
+                disabled={busy !== null}
+                onChange={(event) => setEndPage(event.target.value)}
+                required
+              />
+            </div>
+          </div>
+
+          <button type="submit" disabled={busy !== null}>
+            {busy === "summary" ? "Writing summary…" : "Generate summary"}
+          </button>
+        </form>
+      </section>
+
+      <Flashcards
+        key={documentVersion}
+        disabled={busy !== null}
+        onBusyChange={(isBusy) =>
+          setBusy(isBusy ? "flashcards" : null)
+        }
+      />
+
+      {busy && busy !== "flashcards" && (
         <p className="muted" role="status">
-          {busy === "ask"
-            ? "Your local model is generating the answer. This may take a moment."
-            : "Extracting text and creating embeddings…"}
+          {busy === "upload"
+            ? "Extracting text and creating embeddings…"
+            : "Your local model is generating the result. This may take a moment."}
         </p>
       )}
 
@@ -190,8 +328,8 @@ function App() {
       )}
 
       {result && (
-        <section className="card" aria-labelledby="answer-heading">
-          <h2 id="answer-heading">Answer</h2>
+        <section className="card" aria-labelledby="result-heading">
+          <h2 id="result-heading">{resultTitle}</h2>
           <p className="document-name">{result.filename}</p>
           <div className="answer">{result.answer}</div>
 
@@ -199,7 +337,7 @@ function App() {
             <div className="sources">
               <h3>Source passages</h3>
               <p className="muted">
-                Open a passage to check the answer against your lecture.
+                Open a passage to check the result against your lecture.
               </p>
 
               {result.sources.map((source) => (

@@ -157,3 +157,31 @@ details p {
     padding: 20px;
   }
 }
+
+.page-range {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.page-range > div {
+  display: grid;
+  gap: 8px;
+}
+
+.flashcard-list {
+  margin-top: 28px;
+}
+
+.flashcard {
+  margin-top: 16px;
+  padding: 22px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #f8fafc;
+}
+
+.flashcard h3 {
+  margin: 12px 0 20px;
+  line-height: 1.6;
+}
