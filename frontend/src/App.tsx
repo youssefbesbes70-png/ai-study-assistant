@@ -2,6 +2,7 @@ import { useState } from "react"
 import type { FormEvent } from "react"
 import Flashcards from "./Flashcards"
 import "./App.css"
+import Quiz from "./Quiz"
 
 const API_URL = "http://127.0.0.1:8000"
 
@@ -57,7 +58,7 @@ function App() {
   const [result, setResult] = useState<AnswerResponse | null>(null)
   const [resultTitle, setResultTitle] = useState("Answer")
   const [busy, setBusy] = useState<
-    "upload" | "ask" | "summary" | "flashcards" | null
+    "upload" | "ask" | "summary" | "flashcards" | "quiz" | null
   >(null)
   const [error, setError] = useState("")
 
@@ -312,8 +313,13 @@ function App() {
           setBusy(isBusy ? "flashcards" : null)
         }
       />
+      <Quiz
+        key={documentVersion}
+        disabled={busy !== null}
+        onBusyChange={(isBusy) => setBusy(isBusy ? "quiz" : null)}
+      />
 
-      {busy && busy !== "flashcards" && (
+      {busy && busy !== "flashcards" && busy !== "quiz" && (
         <p className="muted" role="status">
           {busy === "upload"
             ? "Extracting text and creating embeddings…"
