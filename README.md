@@ -2,6 +2,8 @@
 
 An application that helps students study lecture PDFs using retrieval-augmented generation (RAG) and a locally running language model.
 
+> 🚧 **Work in progress:** This project is under active development. PDF upload, document Q&A with page references, summaries, flashcards, and quizzes are implemented. Multiple-document support, database integration, authentication, and saved study sessions are planned.
+
 ## Features
 
 - Upload a lecture PDF and extract text by page.
