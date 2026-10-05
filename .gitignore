@@ -12,3 +12,6 @@ dist/
 backend/document_chunks.json
 
 *.pdf
+
+# Local study history
+backend/study_history.db*

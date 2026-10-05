@@ -1,23 +1,34 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import type { FormEvent } from "react"
 import Flashcards from "./Flashcards"
 import "./App.css"
 import Quiz from "./Quiz"
-
 const API_URL = "http://127.0.0.1:8000"
-
 type Source = {
   source_id: number
   page: number
   text: string
   similarity?: number
 }
-
 type AnswerResponse = {
   filename: string
   answer: string
   sources: Source[]
 }
+type HistoryEntry = AnswerResponse & {
+  id: string
+  question: string
+  created_at: string
+}
+
+type HistoryResponse = {
+  entries: HistoryEntry[]
+  total: number
+  limit: number
+  offset: number
+}
+
+const HISTORY_PAGE_SIZE = 10
 
 type SummaryResponse = {
   filename: string
@@ -26,17 +37,14 @@ type SummaryResponse = {
   summary: string
   sources: Source[]
 }
-
 type UploadResponse = {
   filename: string
   page_count: number
   chunk_count: number
   message: string
 }
-
 async function readResponse<T>(response: Response): Promise<T> {
   const data = await response.json()
-
   if (!response.ok) {
     throw new Error(
       typeof data.detail === "string"
@@ -44,10 +52,8 @@ async function readResponse<T>(response: Response): Promise<T> {
         : "The request failed. Check the backend terminal.",
     )
   }
-
   return data as T
 }
-
 function App() {
   const [file, setFile] = useState<File | null>(null)
   const [document, setDocument] = useState<UploadResponse | null>(null)
@@ -61,27 +67,54 @@ function App() {
     "upload" | "ask" | "summary" | "flashcards" | "quiz" | null
   >(null)
   const [error, setError] = useState("")
+  const [history, setHistory] = useState<HistoryResponse | null>(null)
+  const [historyOffset, setHistoryOffset] = useState(0)
+  const [historyVersion, setHistoryVersion] = useState(0)
+  const [historyLoading, setHistoryLoading] = useState(true)
+  const [historyError, setHistoryError] = useState("")
 
+  useEffect(() => {
+    const controller = new AbortController()
+
+    async function loadHistory() {
+      setHistoryLoading(true)
+      setHistoryError("")
+      setHistory(null)
+      try {
+        const response = await fetch(
+          `${API_URL}/history?limit=${HISTORY_PAGE_SIZE}&offset=${historyOffset}`,
+          { signal: controller.signal },
+        )
+        const saved = await readResponse<HistoryResponse>(response)
+        if (!controller.signal.aborted) setHistory(saved)
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setHistoryError(
+            error instanceof Error ? error.message : "Could not load study history.",
+          )
+        }
+      } finally {
+        if (!controller.signal.aborted) setHistoryLoading(false)
+      }
+    }
+
+    void loadHistory()
+    return () => controller.abort()
+  }, [historyOffset, historyVersion])
   async function handleUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-
     if (!file || busy) return
-
     setError("")
     setResult(null)
     setBusy("upload")
-
     try {
       const formData = new FormData()
       formData.append("file", file)
-
       const response = await fetch(`${API_URL}/upload`, {
         method: "POST",
         body: formData,
       })
-
       const uploaded = await readResponse<UploadResponse>(response)
-
       setDocument(uploaded)
       setDocumentVersion((previous) => previous + 1)
       setStartPage("1")
@@ -96,16 +129,12 @@ function App() {
       setBusy(null)
     }
   }
-
   async function handleAsk(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-
     if (!question.trim() || busy) return
-
     setError("")
     setResult(null)
     setBusy("ask")
-
     try {
       const response = await fetch(`${API_URL}/ask`, {
         method: "POST",
@@ -116,11 +145,11 @@ function App() {
           question: question.trim(),
         }),
       })
-
       const answer = await readResponse<AnswerResponse>(response)
-
       setResultTitle("Answer")
       setResult(answer)
+      setHistoryOffset(0)
+      setHistoryVersion((previous) => previous + 1)
     } catch (error) {
       setError(
         error instanceof Error
@@ -131,17 +160,12 @@ function App() {
       setBusy(null)
     }
   }
-
   async function handleSummary(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-
     if (busy) return
-
     setError("")
-
     const start = Number(startPage)
     const end = Number(endPage)
-
     if (
       !Number.isInteger(start) ||
       !Number.isInteger(end) ||
@@ -151,15 +175,12 @@ function App() {
       setError("Enter a valid page range.")
       return
     }
-
     if (end - start + 1 > 5) {
       setError("Select up to 5 pages at a time.")
       return
     }
-
     setResult(null)
     setBusy("summary")
-
     try {
       const response = await fetch(`${API_URL}/summary`, {
         method: "POST",
@@ -171,9 +192,7 @@ function App() {
           end_page: end,
         }),
       })
-
       const summary = await readResponse<SummaryResponse>(response)
-
       setResultTitle(`Summary · Pages ${start}–${end}`)
       setResult({
         filename: summary.filename,
@@ -190,24 +209,21 @@ function App() {
       setBusy(null)
     }
   }
-
   return (
     <main className="app">
       <header className="page-header">
         <span className="eyebrow">YOUR LECTURES, EXPLAINED</span>
         <h1>AI Study Assistant</h1>
         <p>
-          Ask questions, summarize your lectures, and practice with flashcards.
+          Ask questions, summarize your lectures, and practice with flashcards and quizzes.
         </p>
       </header>
-
       <section className="card" aria-labelledby="upload-heading">
         <h2 id="upload-heading">1. Upload your lecture</h2>
         <p className="muted">
           One PDF at a time, up to 10 MB. A new upload replaces the previous
           document.
         </p>
-
         <form onSubmit={handleUpload}>
           <label htmlFor="lecture">Lecture PDF</label>
           <input
@@ -220,12 +236,10 @@ function App() {
               setError("")
             }}
           />
-
           <button type="submit" disabled={!file || busy !== null}>
             {busy === "upload" ? "Processing PDF…" : "Upload PDF"}
           </button>
         </form>
-
         {document && (
           <p className="success" role="status">
             Ready: {document.filename} · {document.page_count} pages ·{" "}
@@ -233,13 +247,11 @@ function App() {
           </p>
         )}
       </section>
-
       <section className="card" aria-labelledby="question-heading">
         <h2 id="question-heading">2. Ask a question</h2>
         <p className="muted">
           Ask about your uploaded lecture or the PDF already saved.
         </p>
-
         <form onSubmit={handleAsk}>
           <label htmlFor="question">Your question</label>
           <textarea
@@ -251,7 +263,6 @@ function App() {
             onChange={(event) => setQuestion(event.target.value)}
             required
           />
-
           <button
             type="submit"
             disabled={!question.trim() || busy !== null}
@@ -260,13 +271,11 @@ function App() {
           </button>
         </form>
       </section>
-
       <section className="card" aria-labelledby="summary-heading">
         <h2 id="summary-heading">3. Summarize a page range</h2>
         <p className="muted">
           Select up to 5 PDF pages. For dense text, you may need a smaller range.
         </p>
-
         <form onSubmit={handleSummary}>
           <div className="page-range">
             <div>
@@ -283,7 +292,6 @@ function App() {
                 required
               />
             </div>
-
             <div>
               <label htmlFor="end-page">To page</label>
               <input
@@ -299,13 +307,11 @@ function App() {
               />
             </div>
           </div>
-
           <button type="submit" disabled={busy !== null}>
             {busy === "summary" ? "Writing summary…" : "Generate summary"}
           </button>
         </form>
       </section>
-
       <Flashcards
         key={documentVersion}
         disabled={busy !== null}
@@ -318,7 +324,6 @@ function App() {
         disabled={busy !== null}
         onBusyChange={(isBusy) => setBusy(isBusy ? "quiz" : null)}
       />
-
       {busy && busy !== "flashcards" && busy !== "quiz" && (
         <p className="muted" role="status">
           {busy === "upload"
@@ -326,26 +331,22 @@ function App() {
             : "Your local model is generating the result. This may take a moment."}
         </p>
       )}
-
       {error && (
         <p className="error" role="alert">
           {error}
         </p>
       )}
-
       {result && (
         <section className="card" aria-labelledby="result-heading">
           <h2 id="result-heading">{resultTitle}</h2>
           <p className="document-name">{result.filename}</p>
           <div className="answer">{result.answer}</div>
-
           {result.sources.length > 0 && (
             <div className="sources">
               <h3>Source passages</h3>
               <p className="muted">
                 Open a passage to check the result against your lecture.
               </p>
-
               {result.sources.map((source) => (
                 <details key={source.source_id}>
                   <summary>Page {source.page}</summary>
@@ -356,8 +357,81 @@ function App() {
           )}
         </section>
       )}
+      <section className="card" aria-labelledby="history-heading">
+        <h2 id="history-heading">6. Your study history</h2>
+        <p className="muted">
+          Saved questions and answers from all your uploaded lectures.
+          Summaries, flashcards, and quizzes are not saved here yet.
+        </p>
+        <button
+          type="button"
+          disabled={historyLoading}
+          onClick={() => setHistoryVersion((previous) => previous + 1)}
+        >
+          {historyLoading ? "Loading history…" : "Refresh history"}
+        </button>
+
+        {historyLoading && <p role="status">Loading saved answers…</p>}
+        {historyError && <p className="error" role="alert">{historyError}</p>}
+
+        {history && (
+          <>
+            <p className="muted">
+              {history.total === 0
+                ? "No saved questions yet. Ask a question to start your history."
+                : `${history.total} saved question${history.total === 1 ? "" : "s"}.`}
+            </p>
+            {history.entries.map((entry) => (
+              <details key={entry.id}>
+                <summary>{entry.question}</summary>
+                <p className="document-name">{entry.filename}</p>
+                <p className="muted">
+                  <time dateTime={entry.created_at}>
+                    {new Date(entry.created_at).toLocaleString()}
+                  </time>
+                </p>
+                <div className="answer">{entry.answer}</div>
+                {entry.sources.length > 0 && (
+                  <div className="sources">
+                    <h3>Saved source passages</h3>
+                    {entry.sources.map((source) => (
+                      <details key={source.source_id}>
+                        <summary>Page {source.page}</summary>
+                        <p>{source.text}</p>
+                      </details>
+                    ))}
+                  </div>
+                )}
+              </details>
+            ))}
+            {history.total > 0 && (
+              <div>
+                <p className="muted">
+                  Page {Math.floor(historyOffset / HISTORY_PAGE_SIZE) + 1} of{" "}
+                  {Math.ceil(history.total / HISTORY_PAGE_SIZE)}
+                </p>
+                <button
+                  type="button"
+                  disabled={historyLoading || historyOffset === 0}
+                  onClick={() => setHistoryOffset((previous) =>
+                    Math.max(0, previous - HISTORY_PAGE_SIZE),
+                  )}
+                >
+                  Previous page
+                </button>{" "}
+                <button
+                  type="button"
+                  disabled={historyLoading || historyOffset + HISTORY_PAGE_SIZE >= history.total}
+                  onClick={() => setHistoryOffset((previous) => previous + HISTORY_PAGE_SIZE)}
+                >
+                  Next page
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </section>
     </main>
   )
 }
-
 export default App
