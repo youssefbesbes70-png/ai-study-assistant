@@ -20,16 +20,13 @@ type HistoryEntry = AnswerResponse & {
   question: string
   created_at: string
 }
-
 type HistoryResponse = {
   entries: HistoryEntry[]
   total: number
   limit: number
   offset: number
 }
-
 const HISTORY_PAGE_SIZE = 10
-
 type SummaryResponse = {
   filename: string
   start_page: number
@@ -37,7 +34,19 @@ type SummaryResponse = {
   summary: string
   sources: Source[]
 }
-type UploadResponse = {
+type SavedDocument = {
+  document_id: string
+  filename: string
+  page_count: number
+  chunk_count: number
+  created_at: string
+}
+
+type DocumentsResponse = {
+  documents: SavedDocument[]
+}
+
+type UploadResponse = SavedDocument & {
   filename: string
   page_count: number
   chunk_count: number
@@ -56,8 +65,12 @@ async function readResponse<T>(response: Response): Promise<T> {
 }
 function App() {
   const [file, setFile] = useState<File | null>(null)
-  const [document, setDocument] = useState<UploadResponse | null>(null)
-  const [documentVersion, setDocumentVersion] = useState(0)
+  const [documents, setDocuments] = useState<SavedDocument[]>([])
+  const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null)
+  const [documentsVersion, setDocumentsVersion] = useState(0)
+  const [documentsLoading, setDocumentsLoading] = useState(true)
+  const [documentsError, setDocumentsError] = useState("")
+  const document = documents.find((item) => item.document_id === selectedDocumentId)
   const [question, setQuestion] = useState("")
   const [startPage, setStartPage] = useState("10")
   const [endPage, setEndPage] = useState("12")
@@ -72,10 +85,49 @@ function App() {
   const [historyVersion, setHistoryVersion] = useState(0)
   const [historyLoading, setHistoryLoading] = useState(true)
   const [historyError, setHistoryError] = useState("")
+  const studyDisabled = busy !== null || documentsLoading || !document
 
   useEffect(() => {
     const controller = new AbortController()
+    async function loadDocuments() {
+      setDocumentsLoading(true)
+      setDocumentsError("")
+      try {
+        const response = await fetch(`${API_URL}/documents`, {
+          signal: controller.signal,
+        })
+        const saved = await readResponse<DocumentsResponse>(response)
+        if (!controller.signal.aborted) {
+          setDocuments(saved.documents)
+          setSelectedDocumentId((previous) =>
+            saved.documents.some((item) => item.document_id === previous)
+              ? previous
+              : saved.documents[0]?.document_id ?? null,
+          )
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setDocumentsError(
+            error instanceof Error ? error.message : "Could not load documents.",
+          )
+        }
+      } finally {
+        if (!controller.signal.aborted) setDocumentsLoading(false)
+      }
+    }
+    void loadDocuments()
+    return () => controller.abort()
+  }, [documentsVersion])
 
+  useEffect(() => {
+    setQuestion("")
+    setResult(null)
+    setError("")
+    setStartPage("1")
+    setEndPage(String(Math.min(3, document?.page_count ?? 1)))
+  }, [selectedDocumentId, document?.page_count])
+  useEffect(() => {
+    const controller = new AbortController()
     async function loadHistory() {
       setHistoryLoading(true)
       setHistoryError("")
@@ -97,13 +149,12 @@ function App() {
         if (!controller.signal.aborted) setHistoryLoading(false)
       }
     }
-
     void loadHistory()
     return () => controller.abort()
   }, [historyOffset, historyVersion])
   async function handleUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!file || busy) return
+    if (!file || busy || documentsLoading) return
     setError("")
     setResult(null)
     setBusy("upload")
@@ -115,8 +166,9 @@ function App() {
         body: formData,
       })
       const uploaded = await readResponse<UploadResponse>(response)
-      setDocument(uploaded)
-      setDocumentVersion((previous) => previous + 1)
+      setDocuments((previous) => [uploaded, ...previous])
+      setSelectedDocumentId(uploaded.document_id)
+      setDocumentsError("")
       setStartPage("1")
       setEndPage(String(Math.min(3, uploaded.page_count)))
     } catch (error) {
@@ -131,7 +183,7 @@ function App() {
   }
   async function handleAsk(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!question.trim() || busy) return
+    if (!question.trim() || studyDisabled || !document) return
     setError("")
     setResult(null)
     setBusy("ask")
@@ -143,6 +195,7 @@ function App() {
         },
         body: JSON.stringify({
           question: question.trim(),
+          document_id: document.document_id,
         }),
       })
       const answer = await readResponse<AnswerResponse>(response)
@@ -162,7 +215,7 @@ function App() {
   }
   async function handleSummary(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (busy) return
+    if (studyDisabled || !document) return
     setError("")
     const start = Number(startPage)
     const end = Number(endPage)
@@ -173,6 +226,10 @@ function App() {
       end < start
     ) {
       setError("Enter a valid page range.")
+      return
+    }
+    if (end > document.page_count) {
+      setError(`This PDF has only ${document.page_count} pages.`)
       return
     }
     if (end - start + 1 > 5) {
@@ -188,6 +245,7 @@ function App() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
+          document_id: document.document_id,
           start_page: start,
           end_page: end,
         }),
@@ -221,8 +279,8 @@ function App() {
       <section className="card" aria-labelledby="upload-heading">
         <h2 id="upload-heading">1. Upload your lecture</h2>
         <p className="muted">
-          One PDF at a time, up to 10 MB. A new upload replaces the previous
-          document.
+          Upload one PDF at a time, up to 10 MB. Your previously uploaded
+          lectures stay saved.
         </p>
         <form onSubmit={handleUpload}>
           <label htmlFor="lecture">Lecture PDF</label>
@@ -230,13 +288,13 @@ function App() {
             id="lecture"
             type="file"
             accept=".pdf,application/pdf"
-            disabled={busy !== null}
+            disabled={busy !== null || documentsLoading}
             onChange={(event) => {
               setFile(event.target.files?.[0] ?? null)
               setError("")
             }}
           />
-          <button type="submit" disabled={!file || busy !== null}>
+          <button type="submit" disabled={!file || busy !== null || documentsLoading}>
             {busy === "upload" ? "Processing PDF…" : "Upload PDF"}
           </button>
         </form>
@@ -247,10 +305,43 @@ function App() {
           </p>
         )}
       </section>
+      <section className="card" aria-labelledby="document-heading">
+        <h2 id="document-heading">Choose your lecture</h2>
+        <p className="muted">
+          Questions, summaries, flashcards, and quizzes use this document.
+        </p>
+        <label htmlFor="selected-document">Saved lecture</label>
+        <select
+          id="selected-document"
+          value={selectedDocumentId ?? ""}
+          disabled={busy !== null || documentsLoading || documents.length === 0}
+          onChange={(event) => setSelectedDocumentId(event.target.value)}
+          style={{ width: "100%", padding: "12px", margin: "12px 0", font: "inherit" }}
+        >
+          {documents.length === 0 && <option value="">No saved lectures</option>}
+          {documents.map((item, index) => (
+            <option key={item.document_id} value={item.document_id}>
+              {item.filename} · {item.page_count} pages · Upload {documents.length - index}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          disabled={busy !== null || documentsLoading}
+          onClick={() => setDocumentsVersion((previous) => previous + 1)}
+        >
+          {documentsLoading ? "Loading lectures…" : "Refresh lectures"}
+        </button>
+        {documentsError && <p className="error" role="alert">{documentsError}</p>}
+        {!documentsLoading && !documentsError && documents.length === 0 && (
+          <p className="muted">Upload a PDF to start studying.</p>
+        )}
+        {document && <p className="muted">Selected lecture: {document.filename}</p>}
+      </section>
       <section className="card" aria-labelledby="question-heading">
         <h2 id="question-heading">2. Ask a question</h2>
         <p className="muted">
-          Ask about your uploaded lecture or the PDF already saved.
+          Ask about the lecture selected above.
         </p>
         <form onSubmit={handleAsk}>
           <label htmlFor="question">Your question</label>
@@ -259,13 +350,13 @@ function App() {
             placeholder="How are vertices and edges defined?"
             value={question}
             maxLength={2000}
-            disabled={busy !== null}
+            disabled={studyDisabled}
             onChange={(event) => setQuestion(event.target.value)}
             required
           />
           <button
             type="submit"
-            disabled={!question.trim() || busy !== null}
+            disabled={!question.trim() || studyDisabled}
           >
             {busy === "ask" ? "Writing answer…" : "Ask question"}
           </button>
@@ -287,7 +378,7 @@ function App() {
                 max={document?.page_count}
                 step={1}
                 value={startPage}
-                disabled={busy !== null}
+                disabled={studyDisabled}
                 onChange={(event) => setStartPage(event.target.value)}
                 required
               />
@@ -301,27 +392,31 @@ function App() {
                 max={document?.page_count}
                 step={1}
                 value={endPage}
-                disabled={busy !== null}
+                disabled={studyDisabled}
                 onChange={(event) => setEndPage(event.target.value)}
                 required
               />
             </div>
           </div>
-          <button type="submit" disabled={busy !== null}>
+          <button type="submit" disabled={studyDisabled}>
             {busy === "summary" ? "Writing summary…" : "Generate summary"}
           </button>
         </form>
       </section>
       <Flashcards
-        key={documentVersion}
-        disabled={busy !== null}
+        key={`flashcards-${selectedDocumentId ?? "no-document"}`}
+        documentId={document?.document_id ?? null}
+        pageCount={document?.page_count ?? 0}
+        disabled={studyDisabled}
         onBusyChange={(isBusy) =>
           setBusy(isBusy ? "flashcards" : null)
         }
       />
       <Quiz
-        key={documentVersion}
-        disabled={busy !== null}
+        key={`quiz-${selectedDocumentId ?? "no-document"}`}
+        documentId={document?.document_id ?? null}
+        pageCount={document?.page_count ?? 0}
+        disabled={studyDisabled}
         onBusyChange={(isBusy) => setBusy(isBusy ? "quiz" : null)}
       />
       {busy && busy !== "flashcards" && busy !== "quiz" && (
@@ -370,10 +465,8 @@ function App() {
         >
           {historyLoading ? "Loading history…" : "Refresh history"}
         </button>
-
         {historyLoading && <p role="status">Loading saved answers…</p>}
         {historyError && <p className="error" role="alert">{historyError}</p>}
-
         {history && (
           <>
             <p className="muted">

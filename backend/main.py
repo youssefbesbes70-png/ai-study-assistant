@@ -29,11 +29,14 @@ ANSWER_MODEL = "qwen3:4b-instruct"
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 # Request formats
 class SearchRequest(BaseModel):
+    document_id: str | None = Field(default=None, min_length=1, max_length=100)
     question: str = Field(min_length=1, max_length=2000)
 class SummaryRequest(BaseModel):
+    document_id: str | None = Field(default=None, min_length=1, max_length=100)
     start_page: int = Field(ge=1)
     end_page: int = Field(ge=1)
 class FlashcardRequest(BaseModel):
+    document_id: str | None = Field(default=None, min_length=1, max_length=100)
     start_page: int = Field(ge=1)
     end_page: int = Field(ge=1)
     count: int = Field(default=5, ge=1, le=10)
@@ -51,6 +54,7 @@ class Flashcard(BaseModel):
 class GeneratedFlashcards(BaseModel):
     cards: list[Flashcard]
 class QuizRequest(BaseModel):
+    document_id: str | None = Field(default=None, min_length=1, max_length=100)
     start_page: int = Field(ge=1)
     end_page: int = Field(ge=1)
     count: int = Field(default=3, ge=1, le=5)
@@ -66,13 +70,99 @@ class GeneratedQuiz(BaseModel):
 @lru_cache(maxsize=1)
 def get_embedding_model() -> SentenceTransformer:
     return SentenceTransformer(EMBEDDING_MODEL)
-def load_document() -> dict:
-    if not DATA_FILE.exists():
+def document_metadata(document: dict) -> dict:
+    return {
+        "document_id": document["document_id"],
+        "filename": document["filename"],
+        "page_count": document["page_count"],
+        "chunk_count": len(document["chunks"]),
+        "created_at": document["created_at"],
+    }
+
+
+def load_document(document_id: str | None = None) -> dict:
+    try:
+        with closing(open_history_database()) as connection:
+            if document_id is None:
+                # Compatibility with the current frontend: use the newest upload.
+                row = connection.execute(
+                    "SELECT * FROM documents ORDER BY created_at DESC, rowid DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM documents WHERE id = ?", (document_id,)
+                ).fetchone()
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Could not read saved documents.")
+    if row is None:
         raise HTTPException(
             status_code=404,
-            detail="Upload a PDF first.",
+            detail="Upload a PDF first." if document_id is None else "Document not found.",
         )
-    return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    try:
+        chunks = json.loads(row["chunks"])
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="This document's saved data is unreadable.")
+    return {
+        "document_id": row["id"],
+        "filename": row["filename"],
+        "page_count": row["page_count"],
+        "embedding_model": row["embedding_model"],
+        "chunks": chunks,
+        "created_at": row["created_at"],
+    }
+
+
+def save_document(filename: str, page_count: int, chunks: list[dict]) -> dict:
+    document = {
+        "document_id": str(uuid4()),
+        "filename": filename,
+        "page_count": page_count,
+        "embedding_model": EMBEDDING_MODEL,
+        "chunks": chunks,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        with closing(open_history_database()) as connection:
+            with connection:
+                connection.execute(
+                    """INSERT INTO documents
+                    (id, filename, page_count, embedding_model, chunks, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        document["document_id"], filename, page_count,
+                        EMBEDDING_MODEL, json.dumps(chunks, ensure_ascii=False),
+                        document["created_at"],
+                    ),
+                )
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Could not save the document.")
+    return document_metadata(document)
+
+
+@app.get("/documents")
+def list_documents():
+    try:
+        with closing(open_history_database()) as connection:
+            rows = connection.execute(
+                """SELECT id, filename, page_count, created_at, chunks
+                FROM documents ORDER BY created_at DESC, rowid DESC"""
+            ).fetchall()
+        documents = [
+            {
+                "document_id": row["id"],
+                "filename": row["filename"],
+                "page_count": row["page_count"],
+                "chunk_count": len(json.loads(row["chunks"])),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+    except (sqlite3.Error, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Could not list saved documents.")
+    return {"documents": documents}
+
+
 def make_chunks(
     pages: list[dict],
     chunk_size: int = 180,
@@ -90,14 +180,14 @@ def make_chunks(
                     "text": " ".join(chunk_words),
                 })
     return chunks
-def retrieve_chunks(question: str) -> dict:
+def retrieve_chunks(question: str, document_id: str | None = None) -> dict:
     question = question.strip()
     if not question:
         raise HTTPException(
             status_code=400,
             detail="Enter a question.",
         )
-    document = load_document()
+    document = load_document(document_id)
     if document.get("embedding_model") != EMBEDDING_MODEL:
         raise HTTPException(
             status_code=409,
@@ -127,6 +217,7 @@ def retrieve_chunks(question: str) -> dict:
         reverse=True,
     )
     return {
+        "document_id": document["document_id"],
         "filename": document["filename"],
         "matches": results[:3],
     }
@@ -293,6 +384,8 @@ def open_history_database() -> sqlite3.Connection:
     connection = sqlite3.connect(HISTORY_FILE, timeout=10)
     connection.row_factory = sqlite3.Row
     try:
+        # Serialize schema changes and legacy import across local requests.
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """CREATE TABLE IF NOT EXISTS study_history (
                 id TEXT PRIMARY KEY,
@@ -300,11 +393,58 @@ def open_history_database() -> sqlite3.Connection:
                 question TEXT NOT NULL,
                 answer TEXT NOT NULL,
                 sources TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                document_id TEXT
+            )"""
+        )
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(study_history)")
+        }
+        if "document_id" not in columns:
+            connection.execute("ALTER TABLE study_history ADD COLUMN document_id TEXT")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                page_count INTEGER NOT NULL,
+                embedding_model TEXT NOT NULL,
+                chunks TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )"""
         )
+        # Import the previous single-document JSON once, without deleting it.
+        legacy_exists = connection.execute(
+            "SELECT 1 FROM documents WHERE id = ?", ("legacy",)
+        ).fetchone()
+        if DATA_FILE.exists() and legacy_exists is None:
+            legacy = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            chunks = legacy["chunks"]
+            page_count = legacy.get("page_count") or max(
+                (chunk["page"] for chunk in chunks), default=0
+            )
+            created_at = datetime.fromtimestamp(
+                DATA_FILE.stat().st_mtime, timezone.utc
+            ).isoformat()
+            connection.execute(
+                """INSERT INTO documents
+                (id, filename, page_count, embedding_model, chunks, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    "legacy", legacy["filename"], page_count,
+                    legacy.get("embedding_model", ""),
+                    json.dumps(chunks, ensure_ascii=False), created_at,
+                ),
+            )
         connection.commit()
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        connection.rollback()
+        connection.close()
+        raise HTTPException(
+            status_code=500,
+            detail="Could not import document_chunks.json. Check the old document file.",
+        ) from error
     except sqlite3.Error:
+        connection.rollback()
         connection.close()
         raise
     return connection
@@ -318,8 +458,8 @@ def save_question_history(question: str, result: dict) -> dict:
             with connection:
                 connection.execute(
                     """INSERT INTO study_history
-                    (id, filename, question, answer, sources, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (id, filename, question, answer, sources, created_at, document_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         entry_id,
                         result["filename"],
@@ -327,6 +467,7 @@ def save_question_history(question: str, result: dict) -> dict:
                         result["answer"],
                         json.dumps(result["sources"], ensure_ascii=False),
                         created_at,
+                        result.get("document_id"),
                     ),
                 )
     except sqlite3.Error:
@@ -336,8 +477,6 @@ def save_question_history(question: str, result: dict) -> dict:
         )
     # Preserve the original answer fields for the existing frontend.
     return {**result, "history_id": entry_id, "created_at": created_at}
-
-
 @app.get("/history")
 def get_history(
     limit: int = Query(default=50, ge=1, le=100),
@@ -363,8 +502,6 @@ def get_history(
             detail="Could not read study history.",
         )
     return {"entries": entries, "total": total, "limit": limit, "offset": offset}
-
-
 # API endpoints
 @app.get("/")
 def home():
@@ -409,30 +546,19 @@ async def upload_pdf(file: UploadFile = File(...)):
     )
     for chunk, embedding in zip(chunks, embeddings):
         chunk["embedding"] = embedding.tolist()
-    DATA_FILE.write_text(
-        json.dumps(
-            {
-                "filename": file.filename,
-                "page_count": len(pages),
-                "embedding_model": EMBEDDING_MODEL,
-                "chunks": chunks,
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+    saved = save_document(file.filename, len(pages), chunks)
     return {
-        "filename": file.filename,
-        "page_count": len(pages),
-        "chunk_count": len(chunks),
-        "message": "PDF uploaded and local embeddings saved.",
+        **saved,
+        "message": "PDF uploaded and saved. Your other documents are kept.",
     }
+
+
 @app.post("/search")
 def search_document(request: SearchRequest):
-    return retrieve_chunks(request.question)
+    return retrieve_chunks(request.question, request.document_id)
 @app.post("/ask")
 def ask_document(request: SearchRequest):
-    retrieved = retrieve_chunks(request.question)
+    retrieved = retrieve_chunks(request.question, request.document_id)
     sources = {
         index: chunk
         for index, chunk in enumerate(retrieved["matches"], start=1)
@@ -460,6 +586,7 @@ def ask_document(request: SearchRequest):
     )
     if generated.insufficient_context or not generated.claims:
         result = {
+            "document_id": retrieved["document_id"],
             "filename": retrieved["filename"],
             "answer": (
                 "I couldn't find enough information in the retrieved "
@@ -470,16 +597,15 @@ def ask_document(request: SearchRequest):
     else:
         answer, cited_sources = format_cited_answer(generated, sources)
         result = {
+            "document_id": retrieved["document_id"],
             "filename": retrieved["filename"],
             "answer": answer,
             "sources": cited_sources,
         }
     return save_question_history(request.question, result)
-
-
 @app.post("/summary")
 def summarize_document(request: SummaryRequest):
-    document = load_document()
+    document = load_document(request.document_id)
     sources = select_page_sources(
         document,
         request.start_page,
@@ -507,6 +633,7 @@ def summarize_document(request: SummaryRequest):
     )
     if generated.insufficient_context or not generated.claims:
         return {
+            "document_id": document["document_id"],
             "filename": document["filename"],
             "start_page": request.start_page,
             "end_page": request.end_page,
@@ -519,6 +646,7 @@ def summarize_document(request: SummaryRequest):
         bullet_points=True,
     )
     return {
+        "document_id": document["document_id"],
         "filename": document["filename"],
         "start_page": request.start_page,
         "end_page": request.end_page,
@@ -527,7 +655,7 @@ def summarize_document(request: SummaryRequest):
     }
 @app.post("/flashcards")
 def generate_flashcards(request: FlashcardRequest):
-    document = load_document()
+    document = load_document(request.document_id)
     sources = select_page_sources(
         document,
         request.start_page,
@@ -584,12 +712,13 @@ def generate_flashcards(request: FlashcardRequest):
             ],
         })
     return {
+        "document_id": document["document_id"],
         "filename": document["filename"],
         "cards": cards,
     }
 @app.post("/quiz")
 def generate_quiz(request: QuizRequest):
-    document = load_document()
+    document = load_document(request.document_id)
     sources = select_page_sources(
         document,
         request.start_page,
@@ -663,6 +792,7 @@ def generate_quiz(request: QuizRequest):
             ],
         })
     return {
+        "document_id": document["document_id"],
         "filename": document["filename"],
         "questions": questions,
     }
