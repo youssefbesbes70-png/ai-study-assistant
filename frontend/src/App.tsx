@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react"
-import type { FormEvent } from "react"
+import type { FormEvent, KeyboardEvent } from "react"
 import Flashcards from "./Flashcards"
 import "./App.css"
+import "./StudyTabs.css"
 import Quiz from "./Quiz"
 const API_URL = "http://127.0.0.1:8000"
 type Source = {
@@ -83,7 +84,54 @@ async function readResponse<T>(response: Response): Promise<T> {
   }
   return data as T
 }
+const STUDY_TABS = [
+  { id: "questions", label: "Questions" },
+  { id: "summaries", label: "Summaries" },
+  { id: "flashcards", label: "Flashcards" },
+  { id: "quizzes", label: "Quizzes" },
+] as const
+
+type StudyTab = (typeof STUDY_TABS)[number]["id"]
+
+function ResultCard({ result, title, headingId }: {
+  result: AnswerResponse | null
+  title: string
+  headingId: string
+}) {
+  const resultRef = useRef<HTMLElement | null>(null)
+  useEffect(() => {
+    if (result) resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+  }, [result])
+  if (!result) return null
+  return (
+    <section className="card" aria-labelledby={headingId} ref={resultRef}>
+      <h2 id={headingId}>{title}</h2>
+      <p className="document-name">{result.filename}</p>
+      {result.saved_summary_at && (
+        <p className="success">
+          Saved summary · <time dateTime={result.saved_summary_at}>{new Date(result.saved_summary_at).toLocaleString()}</time>
+        </p>
+      )}
+      <div className="answer">{result.answer}</div>
+      {result.sources.length > 0 && (
+        <div className="sources">
+          <h3>Source passages</h3>
+          <p className="muted">Open a passage to check the result against your lecture.</p>
+          {result.sources.map((source) => (
+            <details key={source.source_id}>
+              <summary>Page {source.page}</summary>
+              <p>{source.text}</p>
+            </details>
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
+
 function App() {
+  const [activeTab, setActiveTab] = useState<StudyTab>("questions")
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const [file, setFile] = useState<File | null>(null)
   const [documents, setDocuments] = useState<SavedDocument[]>([])
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null)
@@ -96,8 +144,9 @@ function App() {
   const [question, setQuestion] = useState("")
   const [startPage, setStartPage] = useState("10")
   const [endPage, setEndPage] = useState("12")
-  const [result, setResult] = useState<AnswerResponse | null>(null)
-  const [resultTitle, setResultTitle] = useState("Answer")
+  const [answerResult, setAnswerResult] = useState<AnswerResponse | null>(null)
+  const [summaryResult, setSummaryResult] = useState<AnswerResponse | null>(null)
+  const [summaryTitle, setSummaryTitle] = useState("Summary")
   const [busy, setBusy] = useState<
     "upload" | "ask" | "summary" | "flashcards" | "quiz" | "delete" | "open-summary" | null
   >(null)
@@ -114,7 +163,6 @@ function App() {
   const [summariesError, setSummariesError] = useState("")
   const [openSummaryError, setOpenSummaryError] = useState("")
   const openingSummary = useRef(false)
-  const resultRef = useRef<HTMLElement | null>(null)
   const studyDisabled = busy !== null || documentsLoading || !document
   useEffect(() => {
     const controller = new AbortController()
@@ -150,7 +198,8 @@ function App() {
   useEffect(() => {
     setDeleteError("")
     setQuestion("")
-    setResult(null)
+    setAnswerResult(null)
+    setSummaryResult(null)
     setError("")
     setStartPage("1")
     setEndPage(String(Math.min(3, document?.page_count ?? 1)))
@@ -206,9 +255,24 @@ function App() {
     return () => controller.abort()
   }, [summariesOffset, summariesVersion])
 
-  useEffect(() => {
-    if (result) resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
-  }, [result])
+  function selectTab(tab: StudyTab) {
+    if (busy !== null) return
+    setActiveTab(tab)
+    setError("")
+  }
+
+  function handleTabKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    if (busy !== null) return
+    let nextIndex = index
+    if (event.key === "ArrowRight") nextIndex = (index + 1) % STUDY_TABS.length
+    else if (event.key === "ArrowLeft") nextIndex = (index - 1 + STUDY_TABS.length) % STUDY_TABS.length
+    else if (event.key === "Home") nextIndex = 0
+    else if (event.key === "End") nextIndex = STUDY_TABS.length - 1
+    else return
+    event.preventDefault()
+    selectTab(STUDY_TABS[nextIndex].id)
+    tabRefs.current[nextIndex]?.focus()
+  }
 
   async function openSavedSummary(summaryId: string) {
     if (busy !== null || documentsLoading || openingSummary.current) return
@@ -219,8 +283,8 @@ function App() {
     try {
       const response = await fetch(`${API_URL}/saved-summaries/${encodeURIComponent(summaryId)}`)
       const summary = await readResponse<SummaryResponse>(response)
-      setResultTitle(`Saved summary · Pages ${summary.start_page}–${summary.end_page}`)
-      setResult({
+      setSummaryTitle(`Saved summary · Pages ${summary.start_page}–${summary.end_page}`)
+      setSummaryResult({
         filename: summary.filename,
         answer: summary.summary,
         sources: summary.sources,
@@ -257,7 +321,8 @@ function App() {
       const remaining = documents.filter((item) => item.document_id !== selected.document_id)
       setDocuments(remaining)
       setSelectedDocumentId(remaining[0]?.document_id ?? null)
-      setResult(null)
+      setAnswerResult(null)
+    setSummaryResult(null)
       setDeleteNotice(`Deleted "${selected.filename}". Your saved study history is kept.`)
     } catch (error) {
       setDeleteError(
@@ -272,7 +337,8 @@ function App() {
     event.preventDefault()
     if (!file || busy || documentsLoading) return
     setError("")
-    setResult(null)
+    setAnswerResult(null)
+    setSummaryResult(null)
     setBusy("upload")
     try {
       const formData = new FormData()
@@ -301,7 +367,7 @@ function App() {
     event.preventDefault()
     if (!question.trim() || studyDisabled || !document) return
     setError("")
-    setResult(null)
+    setAnswerResult(null)
     setBusy("ask")
     try {
       const response = await fetch(`${API_URL}/ask`, {
@@ -315,8 +381,7 @@ function App() {
         }),
       })
       const answer = await readResponse<AnswerResponse>(response)
-      setResultTitle("Answer")
-      setResult(answer)
+      setAnswerResult(answer)
       setHistoryOffset(0)
       setHistoryVersion((previous) => previous + 1)
     } catch (error) {
@@ -352,7 +417,7 @@ function App() {
       setError("Select up to 5 pages at a time.")
       return
     }
-    setResult(null)
+    setSummaryResult(null)
     setOpenSummaryError("")
     setBusy("summary")
     try {
@@ -368,8 +433,8 @@ function App() {
         }),
       })
       const summary = await readResponse<SummaryResponse>(response)
-      setResultTitle(`Summary · Pages ${start}–${end}`)
-      setResult({
+      setSummaryTitle(`Summary · Pages ${start}–${end}`)
+      setSummaryResult({
         filename: summary.filename,
         answer: summary.summary,
         sources: summary.sources,
@@ -399,7 +464,7 @@ function App() {
         </p>
       </header>
       <section className="card" aria-labelledby="upload-heading">
-        <h2 id="upload-heading">1. Upload your lecture</h2>
+        <h2 id="upload-heading">Upload your lecture</h2>
         <p className="muted">
           Upload one PDF at a time, up to 10 MB. Your previously uploaded
           lectures stay saved.
@@ -470,8 +535,43 @@ function App() {
         )}
         {document && <p className="muted">Selected lecture: {document.filename}</p>}
       </section>
+      <div className="study-tabs" role="tablist" aria-label="Study tools">
+        {STUDY_TABS.map((tab, index) => (
+          <button
+            key={tab.id}
+            ref={(element) => { tabRefs.current[index] = element }}
+            id={`tab-${tab.id}`}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === tab.id}
+            aria-controls={`panel-${tab.id}`}
+            tabIndex={activeTab === tab.id ? 0 : -1}
+            disabled={busy !== null}
+            onClick={() => selectTab(tab.id)}
+            onKeyDown={(event) => handleTabKeyDown(event, index)}
+          >{tab.label}</button>
+        ))}
+      </div>
+      {busy && busy !== "flashcards" && busy !== "quiz" && busy !== "delete" && (
+        <p className="muted" role="status">
+          {busy === "upload"
+            ? "Extracting text and creating embeddings…"
+            : busy === "open-summary"
+              ? "Opening saved summary…"
+              : "Your local model is generating the result. This may take a moment."}
+        </p>
+      )}
+      {error && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
+      <div
+        id="panel-questions" role="tabpanel" aria-labelledby="tab-questions"
+        className="study-panel" hidden={activeTab !== "questions"} tabIndex={0}
+      >
       <section className="card" aria-labelledby="question-heading">
-        <h2 id="question-heading">2. Ask a question</h2>
+        <h2 id="question-heading">Ask a question</h2>
         <p className="muted">
           Ask about the lecture selected above.
         </p>
@@ -494,8 +594,86 @@ function App() {
           </button>
         </form>
       </section>
+        <ResultCard result={answerResult} title="Answer" headingId="answer-result-heading" />
+      <section className="card" aria-labelledby="history-heading">
+        <h2 id="history-heading">Your question history</h2>
+        <p className="muted">
+          Saved questions and answers from all your uploaded lectures.
+          Use the other tabs for saved summaries, flashcards, and quizzes.
+        </p>
+        <button
+          type="button"
+          disabled={historyLoading}
+          onClick={() => setHistoryVersion((previous) => previous + 1)}
+        >
+          {historyLoading ? "Loading history…" : "Refresh history"}
+        </button>
+        {historyLoading && <p role="status">Loading saved answers…</p>}
+        {historyError && <p className="error" role="alert">{historyError}</p>}
+        {history && (
+          <>
+            <p className="muted">
+              {history.total === 0
+                ? "No saved questions yet. Ask a question to start your history."
+                : `${history.total} saved question${history.total === 1 ? "" : "s"}.`}
+            </p>
+            {history.entries.map((entry) => (
+              <details key={entry.id}>
+                <summary>{entry.question}</summary>
+                <p className="document-name">{entry.filename}</p>
+                <p className="muted">
+                  <time dateTime={entry.created_at}>
+                    {new Date(entry.created_at).toLocaleString()}
+                  </time>
+                </p>
+                <div className="answer">{entry.answer}</div>
+                {entry.sources.length > 0 && (
+                  <div className="sources">
+                    <h3>Saved source passages</h3>
+                    {entry.sources.map((source) => (
+                      <details key={source.source_id}>
+                        <summary>Page {source.page}</summary>
+                        <p>{source.text}</p>
+                      </details>
+                    ))}
+                  </div>
+                )}
+              </details>
+            ))}
+            {history.total > 0 && (
+              <div>
+                <p className="muted">
+                  Page {Math.floor(historyOffset / HISTORY_PAGE_SIZE) + 1} of{" "}
+                  {Math.ceil(history.total / HISTORY_PAGE_SIZE)}
+                </p>
+                <button
+                  type="button"
+                  disabled={historyLoading || historyOffset === 0}
+                  onClick={() => setHistoryOffset((previous) =>
+                    Math.max(0, previous - HISTORY_PAGE_SIZE),
+                  )}
+                >
+                  Previous page
+                </button>{" "}
+                <button
+                  type="button"
+                  disabled={historyLoading || historyOffset + HISTORY_PAGE_SIZE >= history.total}
+                  onClick={() => setHistoryOffset((previous) => previous + HISTORY_PAGE_SIZE)}
+                >
+                  Next page
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </section>
+      </div>
+      <div
+        id="panel-summaries" role="tabpanel" aria-labelledby="tab-summaries"
+        className="study-panel" hidden={activeTab !== "summaries"} tabIndex={0}
+      >
       <section className="card" aria-labelledby="summary-heading">
-        <h2 id="summary-heading">3. Summarize a page range</h2>
+        <h2 id="summary-heading">Summarize a page range</h2>
         <p className="muted">
           Select up to 5 PDF pages. Useful summaries are saved automatically with their source passages.
         </p>
@@ -585,6 +763,12 @@ function App() {
           )}
         </div>
       </section>
+        <ResultCard result={summaryResult} title={summaryTitle} headingId="summary-result-heading" />
+      </div>
+      <div
+        id="panel-flashcards" role="tabpanel" aria-labelledby="tab-flashcards"
+        className="study-panel" hidden={activeTab !== "flashcards"} tabIndex={0}
+      >
       <Flashcards
         key={`flashcards-${selectedDocumentId ?? "no-document"}`}
         documentId={document?.document_id ?? null}
@@ -594,6 +778,11 @@ function App() {
           setBusy(isBusy ? "flashcards" : null)
         }
       />
+      </div>
+      <div
+        id="panel-quizzes" role="tabpanel" aria-labelledby="tab-quizzes"
+        className="study-panel" hidden={activeTab !== "quizzes"} tabIndex={0}
+      >
       <Quiz
         key={`quiz-${selectedDocumentId ?? "no-document"}`}
         documentId={document?.document_id ?? null}
@@ -601,119 +790,9 @@ function App() {
         disabled={studyDisabled}
         onBusyChange={(isBusy) => setBusy(isBusy ? "quiz" : null)}
       />
-      {busy && busy !== "flashcards" && busy !== "quiz" && busy !== "delete" && (
-        <p className="muted" role="status">
-          {busy === "upload"
-            ? "Extracting text and creating embeddings…"
-            : busy === "open-summary"
-              ? "Opening saved summary…"
-              : "Your local model is generating the result. This may take a moment."}
-        </p>
-      )}
-      {error && (
-        <p className="error" role="alert">
-          {error}
-        </p>
-      )}
-      {result && (
-        <section className="card" aria-labelledby="result-heading" ref={resultRef}>
-          <h2 id="result-heading">{resultTitle}</h2>
-          <p className="document-name">{result.filename}</p>
-          {result.saved_summary_at && (
-            <p className="success">
-              Saved summary · <time dateTime={result.saved_summary_at}>{new Date(result.saved_summary_at).toLocaleString()}</time>
-            </p>
-          )}
-          <div className="answer">{result.answer}</div>
-          {result.sources.length > 0 && (
-            <div className="sources">
-              <h3>Source passages</h3>
-              <p className="muted">
-                Open a passage to check the result against your lecture.
-              </p>
-              {result.sources.map((source) => (
-                <details key={source.source_id}>
-                  <summary>Page {source.page}</summary>
-                  <p>{source.text}</p>
-                </details>
-              ))}
-            </div>
-          )}
-        </section>
-      )}
-      <section className="card" aria-labelledby="history-heading">
-        <h2 id="history-heading">6. Your study history</h2>
-        <p className="muted">
-          Saved questions and answers from all your uploaded lectures.
-          Summaries, flashcards, and quizzes have their own saved lists above.
-        </p>
-        <button
-          type="button"
-          disabled={historyLoading}
-          onClick={() => setHistoryVersion((previous) => previous + 1)}
-        >
-          {historyLoading ? "Loading history…" : "Refresh history"}
-        </button>
-        {historyLoading && <p role="status">Loading saved answers…</p>}
-        {historyError && <p className="error" role="alert">{historyError}</p>}
-        {history && (
-          <>
-            <p className="muted">
-              {history.total === 0
-                ? "No saved questions yet. Ask a question to start your history."
-                : `${history.total} saved question${history.total === 1 ? "" : "s"}.`}
-            </p>
-            {history.entries.map((entry) => (
-              <details key={entry.id}>
-                <summary>{entry.question}</summary>
-                <p className="document-name">{entry.filename}</p>
-                <p className="muted">
-                  <time dateTime={entry.created_at}>
-                    {new Date(entry.created_at).toLocaleString()}
-                  </time>
-                </p>
-                <div className="answer">{entry.answer}</div>
-                {entry.sources.length > 0 && (
-                  <div className="sources">
-                    <h3>Saved source passages</h3>
-                    {entry.sources.map((source) => (
-                      <details key={source.source_id}>
-                        <summary>Page {source.page}</summary>
-                        <p>{source.text}</p>
-                      </details>
-                    ))}
-                  </div>
-                )}
-              </details>
-            ))}
-            {history.total > 0 && (
-              <div>
-                <p className="muted">
-                  Page {Math.floor(historyOffset / HISTORY_PAGE_SIZE) + 1} of{" "}
-                  {Math.ceil(history.total / HISTORY_PAGE_SIZE)}
-                </p>
-                <button
-                  type="button"
-                  disabled={historyLoading || historyOffset === 0}
-                  onClick={() => setHistoryOffset((previous) =>
-                    Math.max(0, previous - HISTORY_PAGE_SIZE),
-                  )}
-                >
-                  Previous page
-                </button>{" "}
-                <button
-                  type="button"
-                  disabled={historyLoading || historyOffset + HISTORY_PAGE_SIZE >= history.total}
-                  onClick={() => setHistoryOffset((previous) => previous + HISTORY_PAGE_SIZE)}
-                >
-                  Next page
-                </button>
-              </div>
-            )}
-          </>
-        )}
-      </section>
+      </div>
     </main>
   )
 }
+
 export default App
