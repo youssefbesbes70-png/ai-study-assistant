@@ -2,7 +2,8 @@ import json
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
+from typing import Annotated
 from functools import lru_cache
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -10,7 +11,7 @@ from urllib.request import Request, urlopen
 import pymupdf
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sentence_transformers import SentenceTransformer
 app = FastAPI()
 app.add_middleware(
@@ -19,7 +20,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type"],
 )
 DATA_FILE = Path(__file__).parent / "document_chunks.json"
@@ -40,6 +41,14 @@ class FlashcardRequest(BaseModel):
     start_page: int = Field(ge=1)
     end_page: int = Field(ge=1)
     count: int = Field(default=5, ge=1, le=10)
+class QuizAttemptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    attempt_id: UUID
+    answers: list[Annotated[int, Field(strict=True, ge=0, le=3)]] = Field(
+        min_length=1, max_length=5,
+    )
+
+
 # Model-response formats
 class AnswerClaim(BaseModel):
     text: str = Field(min_length=1)
@@ -78,8 +87,6 @@ def document_metadata(document: dict) -> dict:
         "chunk_count": len(document["chunks"]),
         "created_at": document["created_at"],
     }
-
-
 def load_document(document_id: str | None = None) -> dict:
     try:
         with closing(open_history_database()) as connection:
@@ -111,8 +118,6 @@ def load_document(document_id: str | None = None) -> dict:
         "chunks": chunks,
         "created_at": row["created_at"],
     }
-
-
 def save_document(filename: str, page_count: int, chunks: list[dict]) -> dict:
     document = {
         "document_id": str(uuid4()),
@@ -138,8 +143,6 @@ def save_document(filename: str, page_count: int, chunks: list[dict]) -> dict:
     except sqlite3.Error:
         raise HTTPException(status_code=500, detail="Could not save the document.")
     return document_metadata(document)
-
-
 @app.get("/documents")
 def list_documents():
     try:
@@ -161,6 +164,28 @@ def list_documents():
     except (sqlite3.Error, json.JSONDecodeError):
         raise HTTPException(status_code=500, detail="Could not list saved documents.")
     return {"documents": documents}
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: str):
+    try:
+        with closing(open_history_database()) as connection:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT filename FROM documents WHERE id = ?", (document_id,)
+                ).fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Document not found.")
+                connection.execute(
+                    "DELETE FROM documents WHERE id = ?", (document_id,)
+                )
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Could not delete this document.")
+    # History stores its own copy of each cited passage; keep those entries.
+    return {
+        "document_id": document_id,
+        "filename": row["filename"],
+        "message": "Lecture deleted. Saved question and answer history is kept.",
+    }
 
 
 def make_chunks(
@@ -412,11 +437,18 @@ def open_history_database() -> sqlite3.Connection:
                 created_at TEXT NOT NULL
             )"""
         )
-        # Import the previous single-document JSON once, without deleting it.
+        # Record import completion independently of the imported document.
+        # Otherwise deleting the legacy lecture would import it again.
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY)"
+        )
         legacy_exists = connection.execute(
             "SELECT 1 FROM documents WHERE id = ?", ("legacy",)
         ).fetchone()
-        if DATA_FILE.exists() and legacy_exists is None:
+        legacy_imported = connection.execute(
+            "SELECT 1 FROM app_migrations WHERE name = ?", ("legacy_document_import",)
+        ).fetchone()
+        if DATA_FILE.exists() and legacy_exists is None and legacy_imported is None:
             legacy = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             chunks = legacy["chunks"]
             page_count = legacy.get("page_count") or max(
@@ -435,6 +467,75 @@ def open_history_database() -> sqlite3.Connection:
                     json.dumps(chunks, ensure_ascii=False), created_at,
                 ),
             )
+        if legacy_exists is not None or DATA_FILE.exists():
+            connection.execute(
+                "INSERT OR IGNORE INTO app_migrations (name) VALUES (?)",
+                ("legacy_document_import",),
+            )
+        # Store a snapshot so decks remain usable after a lecture is deleted.
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS flashcard_decks (
+                id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                start_page INTEGER NOT NULL,
+                end_page INTEGER NOT NULL,
+                card_count INTEGER NOT NULL,
+                cards TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS flashcard_decks_created
+            ON flashcard_decks (created_at DESC, id DESC)"""
+        )
+        # Store a snapshot so quizzes remain usable after a lecture is deleted.
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS saved_quizzes (
+                id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                start_page INTEGER NOT NULL,
+                end_page INTEGER NOT NULL,
+                question_count INTEGER NOT NULL,
+                questions TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS saved_quizzes_created
+            ON saved_quizzes (created_at DESC, id DESC)"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS quiz_attempts (
+                id TEXT PRIMARY KEY,
+                quiz_id TEXT NOT NULL,
+                answers TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                total_questions INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS quiz_attempts_by_quiz
+            ON quiz_attempts (quiz_id, created_at DESC, id DESC)"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS saved_summaries (
+                id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                start_page INTEGER NOT NULL,
+                end_page INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                sources TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS saved_summaries_created
+            ON saved_summaries (created_at DESC, id DESC)"""
+        )
         connection.commit()
     except (OSError, ValueError, KeyError, TypeError) as error:
         connection.rollback()
@@ -448,8 +549,6 @@ def open_history_database() -> sqlite3.Connection:
         connection.close()
         raise
     return connection
-
-
 def save_question_history(question: str, result: dict) -> dict:
     entry_id = str(uuid4())
     created_at = datetime.now(timezone.utc).isoformat()
@@ -502,6 +601,319 @@ def get_history(
             detail="Could not read study history.",
         )
     return {"entries": entries, "total": total, "limit": limit, "offset": offset}
+def save_flashcard_deck(result: dict) -> dict:
+    # Empty generations are displayed, but do not create empty saved decks.
+    if not result["cards"]:
+        return {**result, "deck_id": None}
+    deck_id = str(uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    try:
+        with closing(open_history_database()) as connection:
+            with connection:
+                connection.execute(
+                    """INSERT INTO flashcard_decks
+                    (id, document_id, filename, start_page, end_page,
+                     card_count, cards, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        deck_id, result["document_id"], result["filename"],
+                        result["start_page"], result["end_page"],
+                        len(result["cards"]),
+                        json.dumps(result["cards"], ensure_ascii=False), created_at,
+                    ),
+                )
+    except sqlite3.Error:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save the flashcard deck. Check the backend folder is writable.",
+        )
+    return {**result, "deck_id": deck_id, "created_at": created_at}
+
+
+@app.get("/flashcard-decks")
+def list_flashcard_decks(
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        with closing(open_history_database()) as connection:
+            connection.execute("BEGIN")
+            total = connection.execute(
+                "SELECT COUNT(*) FROM flashcard_decks"
+            ).fetchone()[0]
+            rows = connection.execute(
+                """SELECT id AS deck_id, document_id, filename, start_page,
+                    end_page, card_count, created_at
+                FROM flashcard_decks
+                ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+        decks = [dict(row) for row in rows]
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Could not load saved flashcard decks.")
+    return {"decks": decks, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/flashcard-decks/{deck_id}")
+def get_flashcard_deck(deck_id: str):
+    try:
+        with closing(open_history_database()) as connection:
+            row = connection.execute(
+                "SELECT * FROM flashcard_decks WHERE id = ?", (deck_id,)
+            ).fetchone()
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Could not open this flashcard deck.")
+    if row is None:
+        raise HTTPException(status_code=404, detail="Flashcard deck not found.")
+    try:
+        cards = json.loads(row["cards"])
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="This saved deck is unreadable.")
+    return {
+        "deck_id": row["id"],
+        "document_id": row["document_id"],
+        "filename": row["filename"],
+        "start_page": row["start_page"],
+        "end_page": row["end_page"],
+        "created_at": row["created_at"],
+        "cards": cards,
+    }
+
+
+def save_quiz(result: dict) -> dict:
+    # Empty generations are displayed, but do not create empty saved quizzes.
+    if not result["questions"]:
+        return {**result, "quiz_id": None}
+    quiz_id = str(uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    try:
+        with closing(open_history_database()) as connection:
+            with connection:
+                connection.execute(
+                    """INSERT INTO saved_quizzes
+                    (id, document_id, filename, start_page, end_page,
+                     question_count, questions, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        quiz_id, result["document_id"], result["filename"],
+                        result["start_page"], result["end_page"],
+                        len(result["questions"]),
+                        json.dumps(result["questions"], ensure_ascii=False), created_at,
+                    ),
+                )
+    except sqlite3.Error:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save the quiz. Check the backend folder is writable.",
+        )
+    return {**result, "quiz_id": quiz_id, "created_at": created_at}
+
+
+@app.get("/saved-quizzes")
+def list_saved_quizzes(
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        with closing(open_history_database()) as connection:
+            connection.execute("BEGIN")
+            total = connection.execute(
+                "SELECT COUNT(*) FROM saved_quizzes"
+            ).fetchone()[0]
+            rows = connection.execute(
+                """SELECT id AS quiz_id, document_id, filename, start_page,
+                    end_page, question_count, created_at
+                FROM saved_quizzes
+                ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+        quizzes = [dict(row) for row in rows]
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Could not load saved quizzes.")
+    return {"quizzes": quizzes, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/saved-quizzes/{quiz_id}")
+def get_saved_quiz(quiz_id: str):
+    try:
+        with closing(open_history_database()) as connection:
+            row = connection.execute(
+                "SELECT * FROM saved_quizzes WHERE id = ?", (quiz_id,)
+            ).fetchone()
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Could not open this quiz.")
+    if row is None:
+        raise HTTPException(status_code=404, detail="Quiz not found.")
+    try:
+        questions = json.loads(row["questions"])
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="This saved quiz is unreadable.")
+    return {
+        "quiz_id": row["id"],
+        "document_id": row["document_id"],
+        "filename": row["filename"],
+        "start_page": row["start_page"],
+        "end_page": row["end_page"],
+        "created_at": row["created_at"],
+        "questions": questions,
+    }
+
+
+def format_quiz_attempt(row: sqlite3.Row) -> dict:
+    return {
+        "attempt_id": row["id"],
+        "quiz_id": row["quiz_id"],
+        "answers": json.loads(row["answers"]),
+        "score": row["score"],
+        "total_questions": row["total_questions"],
+        "created_at": row["created_at"],
+    }
+
+
+@app.post("/saved-quizzes/{quiz_id}/attempts")
+def submit_quiz_attempt(quiz_id: str, request: QuizAttemptRequest):
+    quiz = get_saved_quiz(quiz_id)
+    questions = quiz["questions"]
+    if len(request.answers) != len(questions):
+        raise HTTPException(status_code=400, detail="Answer every question exactly once.")
+    if any(choice >= len(question["options"]) for choice, question in zip(request.answers, questions)):
+        raise HTTPException(status_code=400, detail="One of the selected options is invalid.")
+    score = sum(
+        choice == question["correct_index"]
+        for choice, question in zip(request.answers, questions)
+    )
+    attempt_id = str(request.attempt_id)
+    try:
+        with closing(open_history_database()) as connection:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                existing = connection.execute(
+                    "SELECT * FROM quiz_attempts WHERE id = ?", (attempt_id,)
+                ).fetchone()
+                if existing is not None:
+                    # A repeated request after a network failure returns the same attempt.
+                    if existing["quiz_id"] != quiz_id or json.loads(existing["answers"]) != request.answers:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="This attempt ID has already been used for different answers.",
+                        )
+                    return format_quiz_attempt(existing)
+                connection.execute(
+                    """INSERT INTO quiz_attempts
+                    (id, quiz_id, answers, score, total_questions, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        attempt_id, quiz_id, json.dumps(request.answers), score,
+                        len(questions), datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM quiz_attempts WHERE id = ?", (attempt_id,)
+                ).fetchone()
+                result = format_quiz_attempt(row)
+    except (sqlite3.Error, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Could not save this quiz attempt. Try checking your answers again.")
+    return result
+
+
+@app.get("/saved-quizzes/{quiz_id}/attempts")
+def list_quiz_attempts(
+    quiz_id: str,
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    get_saved_quiz(quiz_id)
+    try:
+        with closing(open_history_database()) as connection:
+            connection.execute("BEGIN")
+            total = connection.execute(
+                "SELECT COUNT(*) FROM quiz_attempts WHERE quiz_id = ?", (quiz_id,)
+            ).fetchone()[0]
+            rows = connection.execute(
+                """SELECT * FROM quiz_attempts WHERE quiz_id = ?
+                ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
+                (quiz_id, limit, offset),
+            ).fetchall()
+            attempts = [format_quiz_attempt(row) for row in rows]
+    except (sqlite3.Error, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Could not read quiz attempt history.")
+    return {"quiz_id": quiz_id, "attempts": attempts, "total": total, "limit": limit, "offset": offset}
+
+
+def save_summary(result: dict) -> dict:
+    summary_id = str(uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    try:
+        with closing(open_history_database()) as connection:
+            with connection:
+                connection.execute(
+                    """INSERT INTO saved_summaries
+                    (id, document_id, filename, start_page, end_page,
+                     summary, sources, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        summary_id, result["document_id"], result["filename"],
+                        result["start_page"], result["end_page"], result["summary"],
+                        json.dumps(result["sources"], ensure_ascii=False), created_at,
+                    ),
+                )
+    except sqlite3.Error:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save the summary. Check the backend folder is writable.",
+        )
+    return {**result, "summary_id": summary_id, "created_at": created_at}
+
+
+@app.get("/saved-summaries")
+def list_saved_summaries(
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        with closing(open_history_database()) as connection:
+            connection.execute("BEGIN")
+            total = connection.execute("SELECT COUNT(*) FROM saved_summaries").fetchone()[0]
+            rows = connection.execute(
+                """SELECT id AS summary_id, document_id, filename, start_page,
+                    end_page, created_at
+                FROM saved_summaries
+                ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+        summaries = [dict(row) for row in rows]
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Could not load saved summaries.")
+    return {"summaries": summaries, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/saved-summaries/{summary_id}")
+def get_saved_summary(summary_id: str):
+    try:
+        with closing(open_history_database()) as connection:
+            row = connection.execute(
+                "SELECT * FROM saved_summaries WHERE id = ?", (summary_id,)
+            ).fetchone()
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Could not open this summary.")
+    if row is None:
+        raise HTTPException(status_code=404, detail="Summary not found.")
+    try:
+        sources = json.loads(row["sources"])
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="This saved summary is unreadable.")
+    return {
+        "summary_id": row["id"],
+        "document_id": row["document_id"],
+        "filename": row["filename"],
+        "start_page": row["start_page"],
+        "end_page": row["end_page"],
+        "summary": row["summary"],
+        "sources": sources,
+        "created_at": row["created_at"],
+    }
+
+
 # API endpoints
 @app.get("/")
 def home():
@@ -551,8 +963,6 @@ async def upload_pdf(file: UploadFile = File(...)):
         **saved,
         "message": "PDF uploaded and saved. Your other documents are kept.",
     }
-
-
 @app.post("/search")
 def search_document(request: SearchRequest):
     return retrieve_chunks(request.question, request.document_id)
@@ -637,6 +1047,7 @@ def summarize_document(request: SummaryRequest):
             "filename": document["filename"],
             "start_page": request.start_page,
             "end_page": request.end_page,
+            "summary_id": None,
             "summary": "Not enough readable information to summarize.",
             "sources": [],
         }
@@ -645,14 +1056,14 @@ def summarize_document(request: SummaryRequest):
         sources,
         bullet_points=True,
     )
-    return {
+    return save_summary({
         "document_id": document["document_id"],
         "filename": document["filename"],
         "start_page": request.start_page,
         "end_page": request.end_page,
         "summary": summary,
         "sources": cited_sources,
-    }
+    })
 @app.post("/flashcards")
 def generate_flashcards(request: FlashcardRequest):
     document = load_document(request.document_id)
@@ -711,11 +1122,13 @@ def generate_flashcards(request: FlashcardRequest):
                 for source_id in sorted(set(card.source_ids))
             ],
         })
-    return {
+    return save_flashcard_deck({
         "document_id": document["document_id"],
         "filename": document["filename"],
+        "start_page": request.start_page,
+        "end_page": request.end_page,
         "cards": cards,
-    }
+    })
 @app.post("/quiz")
 def generate_quiz(request: QuizRequest):
     document = load_document(request.document_id)
@@ -791,8 +1204,10 @@ def generate_quiz(request: QuizRequest):
                 for source_id in sorted(set(item.source_ids))
             ],
         })
-    return {
+    return save_quiz({
         "document_id": document["document_id"],
         "filename": document["filename"],
+        "start_page": request.start_page,
+        "end_page": request.end_page,
         "questions": questions,
-    }
+    })

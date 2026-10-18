@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import type { FormEvent } from "react"
 import Flashcards from "./Flashcards"
 import "./App.css"
@@ -14,6 +14,7 @@ type AnswerResponse = {
   filename: string
   answer: string
   sources: Source[]
+  saved_summary_at?: string
 }
 type HistoryEntry = AnswerResponse & {
   id: string
@@ -28,12 +29,33 @@ type HistoryResponse = {
 }
 const HISTORY_PAGE_SIZE = 10
 type SummaryResponse = {
+  summary_id: string | null
+  created_at?: string
+  document_id: string
   filename: string
   start_page: number
   end_page: number
   summary: string
   sources: Source[]
 }
+type SavedSummary = {
+  summary_id: string
+  document_id: string
+  filename: string
+  start_page: number
+  end_page: number
+  created_at: string
+}
+
+type SummariesResponse = {
+  summaries: SavedSummary[]
+  total: number
+  limit: number
+  offset: number
+}
+
+const SUMMARIES_PER_PAGE = 10
+
 type SavedDocument = {
   document_id: string
   filename: string
@@ -41,11 +63,9 @@ type SavedDocument = {
   chunk_count: number
   created_at: string
 }
-
 type DocumentsResponse = {
   documents: SavedDocument[]
 }
-
 type UploadResponse = SavedDocument & {
   filename: string
   page_count: number
@@ -70,6 +90,8 @@ function App() {
   const [documentsVersion, setDocumentsVersion] = useState(0)
   const [documentsLoading, setDocumentsLoading] = useState(true)
   const [documentsError, setDocumentsError] = useState("")
+  const [deleteError, setDeleteError] = useState("")
+  const [deleteNotice, setDeleteNotice] = useState("")
   const document = documents.find((item) => item.document_id === selectedDocumentId)
   const [question, setQuestion] = useState("")
   const [startPage, setStartPage] = useState("10")
@@ -77,7 +99,7 @@ function App() {
   const [result, setResult] = useState<AnswerResponse | null>(null)
   const [resultTitle, setResultTitle] = useState("Answer")
   const [busy, setBusy] = useState<
-    "upload" | "ask" | "summary" | "flashcards" | "quiz" | null
+    "upload" | "ask" | "summary" | "flashcards" | "quiz" | "delete" | "open-summary" | null
   >(null)
   const [error, setError] = useState("")
   const [history, setHistory] = useState<HistoryResponse | null>(null)
@@ -85,8 +107,15 @@ function App() {
   const [historyVersion, setHistoryVersion] = useState(0)
   const [historyLoading, setHistoryLoading] = useState(true)
   const [historyError, setHistoryError] = useState("")
+  const [savedSummaries, setSavedSummaries] = useState<SummariesResponse | null>(null)
+  const [summariesOffset, setSummariesOffset] = useState(0)
+  const [summariesVersion, setSummariesVersion] = useState(0)
+  const [summariesLoading, setSummariesLoading] = useState(true)
+  const [summariesError, setSummariesError] = useState("")
+  const [openSummaryError, setOpenSummaryError] = useState("")
+  const openingSummary = useRef(false)
+  const resultRef = useRef<HTMLElement | null>(null)
   const studyDisabled = busy !== null || documentsLoading || !document
-
   useEffect(() => {
     const controller = new AbortController()
     async function loadDocuments() {
@@ -118,8 +147,8 @@ function App() {
     void loadDocuments()
     return () => controller.abort()
   }, [documentsVersion])
-
   useEffect(() => {
+    setDeleteError("")
     setQuestion("")
     setResult(null)
     setError("")
@@ -152,6 +181,93 @@ function App() {
     void loadHistory()
     return () => controller.abort()
   }, [historyOffset, historyVersion])
+  useEffect(() => {
+    const controller = new AbortController()
+    async function loadSummaries() {
+      setSummariesLoading(true)
+      setSummariesError("")
+      setSavedSummaries(null)
+      try {
+        const response = await fetch(
+          `${API_URL}/saved-summaries?limit=${SUMMARIES_PER_PAGE}&offset=${summariesOffset}`,
+          { signal: controller.signal },
+        )
+        const data = await readResponse<SummariesResponse>(response)
+        if (!controller.signal.aborted) setSavedSummaries(data)
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setSummariesError(error instanceof Error ? error.message : "Could not load saved summaries.")
+        }
+      } finally {
+        if (!controller.signal.aborted) setSummariesLoading(false)
+      }
+    }
+    void loadSummaries()
+    return () => controller.abort()
+  }, [summariesOffset, summariesVersion])
+
+  useEffect(() => {
+    if (result) resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+  }, [result])
+
+  async function openSavedSummary(summaryId: string) {
+    if (busy !== null || documentsLoading || openingSummary.current) return
+    openingSummary.current = true
+    setOpenSummaryError("")
+    setError("")
+    setBusy("open-summary")
+    try {
+      const response = await fetch(`${API_URL}/saved-summaries/${encodeURIComponent(summaryId)}`)
+      const summary = await readResponse<SummaryResponse>(response)
+      setResultTitle(`Saved summary · Pages ${summary.start_page}–${summary.end_page}`)
+      setResult({
+        filename: summary.filename,
+        answer: summary.summary,
+        sources: summary.sources,
+        saved_summary_at: summary.created_at,
+      })
+    } catch (error) {
+      setOpenSummaryError(error instanceof Error ? error.message : "Could not open this summary.")
+    } finally {
+      openingSummary.current = false
+      setBusy(null)
+    }
+  }
+
+  async function handleDeleteDocument() {
+    if (!document || busy !== null || documentsLoading) return
+    const selected = document
+    const confirmed = window.confirm(
+      `Delete "${selected.filename}" from your saved lectures?\n\n` +
+      "Its extracted text and embeddings will be removed. " +
+      "Saved questions, answers, and their source passages will stay available. " +
+      "You can upload the PDF again later.",
+    )
+    if (!confirmed) return
+
+    setDeleteError("")
+    setDeleteNotice("")
+    setBusy("delete")
+    try {
+      const response = await fetch(
+        `${API_URL}/documents/${encodeURIComponent(selected.document_id)}`,
+        { method: "DELETE" },
+      )
+      await readResponse<{ document_id: string; message: string }>(response)
+      const remaining = documents.filter((item) => item.document_id !== selected.document_id)
+      setDocuments(remaining)
+      setSelectedDocumentId(remaining[0]?.document_id ?? null)
+      setResult(null)
+      setDeleteNotice(`Deleted "${selected.filename}". Your saved study history is kept.`)
+    } catch (error) {
+      setDeleteError(
+        error instanceof Error ? error.message : "Could not delete this lecture.",
+      )
+    } finally {
+      setBusy(null)
+    }
+  }
+
   async function handleUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!file || busy || documentsLoading) return
@@ -237,6 +353,7 @@ function App() {
       return
     }
     setResult(null)
+    setOpenSummaryError("")
     setBusy("summary")
     try {
       const response = await fetch(`${API_URL}/summary`, {
@@ -256,7 +373,12 @@ function App() {
         filename: summary.filename,
         answer: summary.summary,
         sources: summary.sources,
+        saved_summary_at: summary.summary_id ? summary.created_at : undefined,
       })
+      if (summary.summary_id) {
+        setSummariesOffset(0)
+        setSummariesVersion((previous) => previous + 1)
+      }
     } catch (error) {
       setError(
         error instanceof Error
@@ -332,6 +454,16 @@ function App() {
         >
           {documentsLoading ? "Loading lectures…" : "Refresh lectures"}
         </button>
+        <button
+          type="button"
+          disabled={!document || busy !== null || documentsLoading}
+          onClick={() => void handleDeleteDocument()}
+          style={{ backgroundColor: "#b91c1c", marginLeft: "8px" }}
+        >
+          {busy === "delete" ? "Deleting lecture…" : "Delete selected lecture"}
+        </button>
+        {deleteError && <p className="error" role="alert">{deleteError}</p>}
+        {deleteNotice && <p className="success" role="status">{deleteNotice}</p>}
         {documentsError && <p className="error" role="alert">{documentsError}</p>}
         {!documentsLoading && !documentsError && documents.length === 0 && (
           <p className="muted">Upload a PDF to start studying.</p>
@@ -365,7 +497,7 @@ function App() {
       <section className="card" aria-labelledby="summary-heading">
         <h2 id="summary-heading">3. Summarize a page range</h2>
         <p className="muted">
-          Select up to 5 PDF pages. For dense text, you may need a smaller range.
+          Select up to 5 PDF pages. Useful summaries are saved automatically with their source passages.
         </p>
         <form onSubmit={handleSummary}>
           <div className="page-range">
@@ -402,6 +534,56 @@ function App() {
             {busy === "summary" ? "Writing summary…" : "Generate summary"}
           </button>
         </form>
+        <div className="sources">
+          <h3>Saved summaries</h3>
+          <p className="muted">
+            Summaries from all lectures remain available here, even after deleting a lecture.
+          </p>
+          <button
+            type="button" disabled={summariesLoading || busy !== null}
+            onClick={() => setSummariesVersion((previous) => previous + 1)}
+          >{summariesLoading ? "Loading saved summaries…" : "Refresh saved summaries"}</button>
+          {summariesError && <p className="error" role="alert">{summariesError}</p>}
+          {openSummaryError && <p className="error" role="alert">{openSummaryError}</p>}
+          {savedSummaries && (
+            <>
+              {savedSummaries.total === 0 && (
+                <p className="muted">No saved summaries yet. Generate a summary to save your first one.</p>
+              )}
+              {savedSummaries.summaries.map((summary) => (
+                <article className="flashcard" key={summary.summary_id}>
+                  <h4>{summary.filename}</h4>
+                  <p className="muted">
+                    Pages {summary.start_page}–{summary.end_page} ·{" "}
+                    <time dateTime={summary.created_at}>{new Date(summary.created_at).toLocaleString()}</time>
+                  </p>
+                  <button
+                    type="button" disabled={busy !== null || documentsLoading}
+                    onClick={() => void openSavedSummary(summary.summary_id)}
+                    aria-label={`Open summary from ${summary.filename}, pages ${summary.start_page} to ${summary.end_page}, saved ${new Date(summary.created_at).toLocaleString()}`}
+                  >Open summary</button>
+                </article>
+              ))}
+              {savedSummaries.total > 0 && (
+                <div>
+                  <p className="muted">
+                    Page {Math.floor(summariesOffset / SUMMARIES_PER_PAGE) + 1} of{" "}
+                    {Math.ceil(savedSummaries.total / SUMMARIES_PER_PAGE)}
+                  </p>
+                  <button
+                    type="button" disabled={summariesLoading || busy !== null || summariesOffset === 0}
+                    onClick={() => setSummariesOffset((previous) => Math.max(0, previous - SUMMARIES_PER_PAGE))}
+                  >Previous summaries</button>{" "}
+                  <button
+                    type="button"
+                    disabled={summariesLoading || busy !== null || summariesOffset + SUMMARIES_PER_PAGE >= savedSummaries.total}
+                    onClick={() => setSummariesOffset((previous) => previous + SUMMARIES_PER_PAGE)}
+                  >Next summaries</button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
       </section>
       <Flashcards
         key={`flashcards-${selectedDocumentId ?? "no-document"}`}
@@ -419,11 +601,13 @@ function App() {
         disabled={studyDisabled}
         onBusyChange={(isBusy) => setBusy(isBusy ? "quiz" : null)}
       />
-      {busy && busy !== "flashcards" && busy !== "quiz" && (
+      {busy && busy !== "flashcards" && busy !== "quiz" && busy !== "delete" && (
         <p className="muted" role="status">
           {busy === "upload"
             ? "Extracting text and creating embeddings…"
-            : "Your local model is generating the result. This may take a moment."}
+            : busy === "open-summary"
+              ? "Opening saved summary…"
+              : "Your local model is generating the result. This may take a moment."}
         </p>
       )}
       {error && (
@@ -432,9 +616,14 @@ function App() {
         </p>
       )}
       {result && (
-        <section className="card" aria-labelledby="result-heading">
+        <section className="card" aria-labelledby="result-heading" ref={resultRef}>
           <h2 id="result-heading">{resultTitle}</h2>
           <p className="document-name">{result.filename}</p>
+          {result.saved_summary_at && (
+            <p className="success">
+              Saved summary · <time dateTime={result.saved_summary_at}>{new Date(result.saved_summary_at).toLocaleString()}</time>
+            </p>
+          )}
           <div className="answer">{result.answer}</div>
           {result.sources.length > 0 && (
             <div className="sources">
@@ -456,7 +645,7 @@ function App() {
         <h2 id="history-heading">6. Your study history</h2>
         <p className="muted">
           Saved questions and answers from all your uploaded lectures.
-          Summaries, flashcards, and quizzes are not saved here yet.
+          Summaries, flashcards, and quizzes have their own saved lists above.
         </p>
         <button
           type="button"
