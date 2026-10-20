@@ -15,3 +15,5 @@ backend/document_chunks.json
 
 # Local study history
 backend/study_history.db*
+
+backend/evaluation-results/
